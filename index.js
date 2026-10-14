@@ -148,6 +148,16 @@ app.post("/signup", async (req, res) => {
   }
 });
 
+app.get("/userlist", async (req, res) => {
+  try {
+    const users = await User.find();
+    res.status(200).json({ users: users.map(sanitizeUser) });
+  } catch (error) {
+    console.error("Error retrieving users from database:", error);
+    res.status(500).json({ error: "Failed to retrieve users" });
+  }
+});
+
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
