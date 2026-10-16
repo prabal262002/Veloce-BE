@@ -14,18 +14,35 @@ dns.setServers(["8.8.8.8", "8.8.4.4"]);
 const app = express();
 const PORT = process.env.PORT || 5001;
 const JWT_SECRET = process.env.JWT_SECRET || (
-  process.env.NODE_ENV === "production" ? null : "veloce-dev-secret"
+  process.env.NODE_ENV === "production" ? "" : "veloce-dev-secret"
 );
-
-if (!JWT_SECRET) {
-  throw new Error("JWT_SECRET must be configured in production");
-}
 
 app.use(express.json());
 app.use(cors({
   origin: process.env.FRONTEND_ORIGIN || "http://localhost:5173",
   credentials: true,
 }));
+
+app.use(async (req, res, next) => {
+  if (req.method === "OPTIONS" || req.path === "/logout") {
+    return next();
+  }
+
+  try {
+    await initializeDB();
+    return next();
+  } catch (error) {
+    console.error("Database connection error:", error.message);
+    return res.status(503).json({ error: "Database unavailable" });
+  }
+});
+
+const requireJwtSecret = (req, res, next) => {
+  if (!JWT_SECRET) {
+    return res.status(503).json({ error: "Authentication is not configured; set JWT_SECRET" });
+  }
+  return next();
+};
 
 const sessionCookieOptions = {
   httpOnly: true,
@@ -68,6 +85,10 @@ const sanitizeUser = (user) => ({
 });
 
 const authenticate = async (req, res, next) => {
+  if (!JWT_SECRET) {
+    return res.status(503).json({ error: "Authentication is not configured; set JWT_SECRET" });
+  }
+
   try {
     const cookieHeader = req.headers.cookie || "";
     const sessionCookie = cookieHeader
@@ -155,7 +176,7 @@ async function createUser(newUser) {
   }
 }
 
-app.post("/signup", async (req, res) => {
+app.post("/signup", requireJwtSecret, async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
@@ -188,7 +209,7 @@ app.post("/signup", async (req, res) => {
   }
 });
 
-app.post("/login", async (req, res) => {
+app.post("/login", requireJwtSecret, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -287,8 +308,17 @@ app.put("/cart", authenticate, async (req, res) => {
   }
 });
 
-initializeDB();
+if (!process.env.VERCEL) {
+  initializeDB()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Main Server is running on port ${PORT}`);
+      });
+    })
+    .catch((error) => {
+      console.error("Unable to connect to MongoDB:", error.message);
+      process.exitCode = 1;
+    });
+}
 
-app.listen(PORT, () => {
-  console.log(`Main Server is running on port ${PORT}`);
-});
+module.exports = app;
