@@ -2,6 +2,7 @@ require("dotenv").config();
 const dns = require("dns");
 const express = require("express");
 const cors = require("cors");
+const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { initializeDB } = require("./db/db.connect.js");
@@ -12,10 +13,45 @@ dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
 const app = express();
 const PORT = process.env.PORT || 5001;
-const JWT_SECRET = process.env.JWT_SECRET || "veloce-dev-secret";
+const JWT_SECRET = process.env.JWT_SECRET || (
+  process.env.NODE_ENV === "production" ? null : "veloce-dev-secret"
+);
+
+if (!JWT_SECRET) {
+  throw new Error("JWT_SECRET must be configured in production");
+}
 
 app.use(express.json());
-app.use(cors()); 
+app.use(cors({
+  origin: process.env.FRONTEND_ORIGIN || "http://localhost:5173",
+  credentials: true,
+}));
+
+const sessionCookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+  path: "/",
+};
+
+const setSessionCookie = (res, user) => {
+  const token = jwt.sign(
+    { userId: user._id, email: user.email },
+    JWT_SECRET,
+    { expiresIn: "7d" }
+  );
+  res.cookie("veloce_session", token, sessionCookieOptions);
+};
+
+const clearSessionCookie = (res) => {
+  res.clearCookie("veloce_session", {
+    httpOnly: true,
+    secure: sessionCookieOptions.secure,
+    sameSite: sessionCookieOptions.sameSite,
+    path: "/",
+  });
+};
 
 const sanitizeUser = (user) => ({
   _id: user._id,
@@ -23,21 +59,27 @@ const sanitizeUser = (user) => ({
   email: user.email,
   phone: user.phone || "",
   addresses: user.addresses || [],
+  cart: (user.cart || []).map((item) => ({
+    productId: String(item.productId),
+    quantity: item.quantity,
+  })),
   createdAt: user.createdAt,
   updatedAt: user.updatedAt,
 });
 
-const createToken = (user) =>
-  jwt.sign({ userId: user._id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
-
 const authenticate = async (req, res, next) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    const cookieHeader = req.headers.cookie || "";
+    const sessionCookie = cookieHeader
+      .split(";")
+      .map((cookie) => cookie.trim())
+      .find((cookie) => cookie.startsWith("veloce_session="));
+
+    if (!sessionCookie) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const token = authHeader.split(" ")[1];
+    const token = decodeURIComponent(sessionCookie.slice("veloce_session=".length));
     const decoded = jwt.verify(token, JWT_SECRET);
 
     const user = await User.findById(decoded.userId);
@@ -106,7 +148,6 @@ async function createUser(newUser) {
   try {
     const user = new User(newUser);
     const savedUser = await user.save();
-    console.log("User created in DB:", savedUser);
     return savedUser;
   } catch (error) {
     console.error("Error saving user to database:", error);
@@ -135,26 +176,15 @@ app.post("/signup", async (req, res) => {
       password: hashedPassword,
     });
 
-    const token = createToken(savedUser);
+    setSessionCookie(res, savedUser);
 
     res.status(201).json({
       message: "User created successfully",
-      token,
       user: sanitizeUser(savedUser),
     });
   } catch (error) {
     console.error("Signup error:", error);
     res.status(500).json({ error: "Failed to create user" });
-  }
-});
-
-app.get("/userlist", async (req, res) => {
-  try {
-    const users = await User.find();
-    res.status(200).json({ users: users.map(sanitizeUser) });
-  } catch (error) {
-    console.error("Error retrieving users from database:", error);
-    res.status(500).json({ error: "Failed to retrieve users" });
   }
 });
 
@@ -177,11 +207,10 @@ app.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
-    const token = createToken(user);
+    setSessionCookie(res, user);
 
     res.status(200).json({
       message: "Login successful",
-      token,
       user: sanitizeUser(user),
     });
   } catch (error) {
@@ -195,6 +224,66 @@ app.get("/me", authenticate, async (req, res) => {
     res.status(200).json({ user: sanitizeUser(req.user) });
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch user" });
+  }
+});
+
+app.post("/logout", (req, res) => {
+  clearSessionCookie(res);
+  res.status(200).json({ message: "Logged out successfully" });
+});
+
+app.get("/cart", authenticate, (req, res) => {
+  res.status(200).json({ cart: sanitizeUser(req.user).cart });
+});
+
+app.put("/cart", authenticate, async (req, res) => {
+  try {
+    const submittedCart = req.body.cart;
+    if (!Array.isArray(submittedCart)) {
+      return res.status(400).json({ error: "Cart must be an array" });
+    }
+
+    const quantitiesByProduct = new Map();
+    for (const item of submittedCart) {
+      const productId = String(item?.productId || "");
+      const quantity = Number(item?.quantity);
+
+      if (!mongoose.isValidObjectId(productId) || !Number.isInteger(quantity) || quantity < 1) {
+        return res.status(400).json({ error: "Cart items need a valid product ID and positive integer quantity" });
+      }
+
+      quantitiesByProduct.set(
+        productId,
+        (quantitiesByProduct.get(productId) || 0) + quantity
+      );
+    }
+
+    const products = await Product.find({
+      _id: { $in: [...quantitiesByProduct.keys()] },
+      isActive: true,
+    });
+    const productsById = new Map(products.map((product) => [String(product._id), product]));
+
+    for (const [productId, quantity] of quantitiesByProduct) {
+      const product = productsById.get(productId);
+      if (!product) {
+        return res.status(400).json({ error: "Cart contains an unavailable product" });
+      }
+      if (quantity > product.stock) {
+        return res.status(400).json({ error: `${product.name} has only ${product.stock} in stock` });
+      }
+    }
+
+    req.user.cart = [...quantitiesByProduct].map(([productId, quantity]) => ({
+      productId,
+      quantity,
+    }));
+    await req.user.save();
+
+    res.status(200).json({ cart: sanitizeUser(req.user).cart });
+  } catch (error) {
+    console.error("Cart update error:", error);
+    res.status(500).json({ error: "Failed to update cart" });
   }
 });
 
