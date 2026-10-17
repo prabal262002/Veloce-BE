@@ -18,10 +18,24 @@ const JWT_SECRET = process.env.JWT_SECRET || (
 );
 
 app.use(express.json());
-app.use(cors({
-  origin: process.env.FRONTEND_ORIGIN || "http://localhost:5173",
-  credentials: true,
-}));
+const allowedOrigins = (process.env.FRONTEND_ORIGIN || "http://localhost:5173")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use((req, res, next) => {
+  const isPublicProductRequest =
+    req.path === "/products" &&
+    (req.method === "GET" ||
+      (req.method === "OPTIONS" && req.headers["access-control-request-method"] === "GET"));
+
+  return cors(isPublicProductRequest
+    ? { origin: "*" }
+    : {
+        origin: allowedOrigins,
+        credentials: true,
+      })(req, res, next);
+});
 
 app.use(async (req, res, next) => {
   if (req.method === "OPTIONS" || req.path === "/logout") {
@@ -75,7 +89,10 @@ const sanitizeUser = (user) => ({
   name: user.name,
   email: user.email,
   phone: user.phone || "",
-  addresses: user.addresses || [],
+  addresses: (user.addresses || []).map((address) => ({
+    ...address.toObject ? address.toObject() : address,
+    _id: address._id ? String(address._id) : undefined,
+  })),
   cart: (user.cart || []).map((item) => ({
     productId: String(item.productId),
     quantity: item.quantity,
@@ -83,6 +100,58 @@ const sanitizeUser = (user) => ({
   createdAt: user.createdAt,
   updatedAt: user.updatedAt,
 });
+
+const buildAddressPayload = (address = {}) => {
+  const nextAddress = { ...address };
+
+  if (typeof nextAddress.label === "string") {
+    nextAddress.label = nextAddress.label.trim() || "Home";
+  } else {
+    nextAddress.label = "Home";
+  }
+
+  [
+    "fullName",
+    "phone",
+    "addressLine1",
+    "city",
+    "state",
+    "postalCode",
+    "country",
+  ].forEach((field) => {
+    if (typeof nextAddress[field] === "string") {
+      nextAddress[field] = nextAddress[field].trim();
+    }
+  });
+
+  nextAddress.isDefault = Boolean(nextAddress.isDefault);
+
+  return nextAddress;
+};
+
+const validateAddressPayload = (address) => {
+  if (!address || typeof address !== "object") {
+    return "Address details are required";
+  }
+
+  const requiredFields = [
+    "fullName",
+    "phone",
+    "addressLine1",
+    "city",
+    "state",
+    "postalCode",
+    "country",
+  ];
+
+  for (const field of requiredFields) {
+    if (!String(address[field] || "").trim()) {
+      return `${field} is required`;
+    }
+  }
+
+  return null;
+};
 
 const authenticate = async (req, res, next) => {
   if (!JWT_SECRET) {
@@ -155,11 +224,7 @@ app.get("/products", async (req, res) => {
   try {
     console.log("GET /products route hit!");
     const products = await getAllProducts();
-    if(products.length > 0) {
-        res.json({ products });
-    }else {
-        res.status(404).json({ message: "No products found" });
-    }
+    res.status(200).json({ products });
   } catch (error) {
     res.status(500).json({ error: "Failed to retrieve products" });
   }
@@ -245,6 +310,122 @@ app.get("/me", authenticate, async (req, res) => {
     res.status(200).json({ user: sanitizeUser(req.user) });
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch user" });
+  }
+});
+
+app.get("/addresses", authenticate, async (req, res) => {
+  try {
+    res.status(200).json({ addresses: sanitizeUser(req.user).addresses });
+  } catch (error) {
+    console.error("Get addresses error:", error);
+    res.status(500).json({ error: "Failed to fetch addresses" });
+  }
+});
+
+app.post("/addresses", authenticate, async (req, res) => {
+  try {
+    const validationError = validateAddressPayload(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    const address = buildAddressPayload(req.body);
+    const shouldBeDefault = address.isDefault || req.user.addresses.length === 0;
+
+    if (shouldBeDefault) {
+      req.user.addresses.forEach((existingAddress) => {
+        existingAddress.isDefault = false;
+      });
+    }
+
+    req.user.addresses.push({ ...address, isDefault: shouldBeDefault });
+    await req.user.save();
+
+    const savedAddress = req.user.addresses[req.user.addresses.length - 1].toObject
+      ? req.user.addresses[req.user.addresses.length - 1].toObject()
+      : req.user.addresses[req.user.addresses.length - 1];
+
+    return res.status(201).json({
+      message: "Address saved successfully",
+      address: savedAddress,
+      addresses: sanitizeUser(req.user).addresses,
+    });
+  } catch (error) {
+    console.error("Create address error:", error);
+    return res.status(500).json({ error: "Failed to save address" });
+  }
+});
+
+app.put("/addresses/:addressId", authenticate, async (req, res) => {
+  try {
+    const { addressId } = req.params;
+    const validationError = validateAddressPayload(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    const addressIndex = req.user.addresses.findIndex(
+      (address) => String(address._id) === String(addressId)
+    );
+
+    if (addressIndex === -1) {
+      return res.status(404).json({ error: "Address not found" });
+    }
+
+    const nextAddress = buildAddressPayload({
+      ...req.user.addresses[addressIndex].toObject
+        ? req.user.addresses[addressIndex].toObject()
+        : req.user.addresses[addressIndex],
+      ...req.body,
+    });
+
+    if (nextAddress.isDefault) {
+      req.user.addresses.forEach((existingAddress) => {
+        existingAddress.isDefault = String(existingAddress._id) === String(addressId);
+      });
+    } else if (!req.user.addresses.some((existingAddress) => existingAddress.isDefault)) {
+      nextAddress.isDefault = true;
+    }
+
+    req.user.addresses[addressIndex] = { ...nextAddress, _id: req.user.addresses[addressIndex]._id };
+    await req.user.save();
+
+    return res.status(200).json({
+      message: "Address updated successfully",
+      addresses: sanitizeUser(req.user).addresses,
+    });
+  } catch (error) {
+    console.error("Update address error:", error);
+    return res.status(500).json({ error: "Failed to update address" });
+  }
+});
+
+app.delete("/addresses/:addressId", authenticate, async (req, res) => {
+  try {
+    const { addressId } = req.params;
+    const addressIndex = req.user.addresses.findIndex(
+      (address) => String(address._id) === String(addressId)
+    );
+
+    if (addressIndex === -1) {
+      return res.status(404).json({ error: "Address not found" });
+    }
+
+    const [removedAddress] = req.user.addresses.splice(addressIndex, 1);
+
+    if (req.user.addresses.length > 0 && removedAddress.isDefault) {
+      req.user.addresses[0].isDefault = true;
+    }
+
+    await req.user.save();
+
+    return res.status(200).json({
+      message: "Address removed successfully",
+      addresses: sanitizeUser(req.user).addresses,
+    });
+  } catch (error) {
+    console.error("Delete address error:", error);
+    return res.status(500).json({ error: "Failed to remove address" });
   }
 });
 
