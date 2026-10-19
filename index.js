@@ -8,6 +8,7 @@ const jwt = require("jsonwebtoken");
 const { initializeDB } = require("./db/db.connect.js");
 const Product = require("./models/product.model");
 const User = require("./models/user.model");
+const Review = require("./models/review.model");
 
 dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
@@ -25,7 +26,7 @@ const allowedOrigins = (process.env.FRONTEND_ORIGIN || "http://localhost:5173")
 
 app.use((req, res, next) => {
   const isPublicProductRequest =
-    req.path === "/products" &&
+    (req.path === "/products" || /^\/products\/[^/]+\/reviews$/.test(req.path)) &&
     (req.method === "GET" ||
       (req.method === "OPTIONS" && req.headers["access-control-request-method"] === "GET"));
 
@@ -148,6 +149,23 @@ const validateAddressPayload = (address) => {
     if (!String(address[field] || "").trim()) {
       return `${field} is required`;
     }
+  }
+
+  return null;
+};
+
+const validateReviewPayload = (review) => {
+  const rating = Number(review?.rating);
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return "Rating must be an integer from 1 to 5";
+  }
+
+  if (review.comment !== undefined && typeof review.comment !== "string") {
+    return "Review comment must be text";
+  }
+
+  if (typeof review.comment === "string" && review.comment.trim().length > 2000) {
+    return "Review comment must be 2000 characters or fewer";
   }
 
   return null;
@@ -310,6 +328,186 @@ app.get("/me", authenticate, async (req, res) => {
     res.status(200).json({ user: sanitizeUser(req.user) });
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch user" });
+  }
+});
+
+app.get("/products/:productId/reviews", async (req, res) => {
+  try {
+    const { productId } = req.params;
+    if (!mongoose.isValidObjectId(productId)) {
+      return res.status(400).json({ error: "Invalid product ID" });
+    }
+
+    const product = await Product.findById(productId).select("_id");
+    if (!product) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const requestedPage = Number.parseInt(req.query.page, 10) || 1;
+    const requestedLimit = Number.parseInt(req.query.limit, 10) || 10;
+    const page = Math.max(requestedPage, 1);
+    const limit = Math.min(Math.max(requestedLimit, 1), 50);
+    const [summary] = await Review.aggregate([
+      { $match: { product: product._id } },
+      {
+        $group: {
+          _id: null,
+          averageRating: { $avg: "$rating" },
+          reviewCount: { $sum: 1 },
+        },
+      },
+    ]);
+
+    const [reviews, total] = await Promise.all([
+      Review.find({ product: product._id })
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .populate("user", "name")
+        .lean(),
+      Review.countDocuments({ product: product._id }),
+    ]);
+
+    return res.status(200).json({
+      summary: {
+        averageRating: summary?.averageRating || 0,
+        reviewCount: summary?.reviewCount || 0,
+      },
+      reviews: reviews.map((review) => ({
+        _id: String(review._id),
+        rating: review.rating,
+        comment: review.comment,
+        createdAt: review.createdAt,
+        user: review.user
+          ? { _id: String(review.user._id), name: review.user.name }
+          : { name: "Rider" },
+      })),
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit),
+      },
+    });
+  } catch (error) {
+    console.error("Get reviews error:", error);
+    return res.status(500).json({ error: "Failed to fetch reviews" });
+  }
+});
+
+app.get("/products/:productId/reviews/me", authenticate, async (req, res) => {
+  try {
+    const { productId } = req.params;
+    if (!mongoose.isValidObjectId(productId)) {
+      return res.status(400).json({ error: "Invalid product ID" });
+    }
+
+    const product = await Product.findById(productId).select("_id");
+    if (!product) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const review = await Review.findOne({ product: productId, user: req.user._id }).lean();
+    return res.status(200).json({
+      review: review
+        ? {
+            _id: String(review._id),
+            rating: review.rating,
+            comment: review.comment,
+            createdAt: review.createdAt,
+          }
+        : null,
+    });
+  } catch (error) {
+    console.error("Get own review error:", error);
+    return res.status(500).json({ error: "Failed to fetch your review" });
+  }
+});
+
+app.post("/products/:productId/reviews", authenticate, async (req, res) => {
+  try {
+    const { productId } = req.params;
+    if (!mongoose.isValidObjectId(productId)) {
+      return res.status(400).json({ error: "Invalid product ID" });
+    }
+
+    const validationError = validateReviewPayload(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    const product = await Product.findById(productId).select("_id");
+    if (!product) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const review = await Review.create({
+      product: product._id,
+      user: req.user._id,
+      rating: Number(req.body.rating),
+      comment: req.body.comment?.trim() || "",
+    });
+
+    return res.status(201).json({
+      message: "Review saved successfully",
+      review: {
+        _id: String(review._id),
+        rating: review.rating,
+        comment: review.comment,
+        createdAt: review.createdAt,
+      },
+    });
+  } catch (error) {
+    if (error.code === 11000) {
+      return res.status(409).json({ error: "You have already reviewed this product" });
+    }
+    console.error("Create review error:", error);
+    return res.status(500).json({ error: "Failed to save review" });
+  }
+});
+
+app.put("/products/:productId/reviews/me", authenticate, async (req, res) => {
+  try {
+    const { productId } = req.params;
+    if (!mongoose.isValidObjectId(productId)) {
+      return res.status(400).json({ error: "Invalid product ID" });
+    }
+
+    const product = await Product.findById(productId).select("_id");
+    if (!product) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const validationError = validateReviewPayload(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    const review = await Review.findOneAndUpdate(
+      { product: productId, user: req.user._id },
+      {
+        rating: Number(req.body.rating),
+        comment: req.body.comment?.trim() || "",
+      },
+      { new: true, runValidators: true }
+    ).lean();
+
+    if (!review) {
+      return res.status(404).json({ error: "Your review was not found" });
+    }
+
+    return res.status(200).json({
+      message: "Review updated successfully",
+      review: {
+        _id: String(review._id),
+        rating: review.rating,
+        comment: review.comment,
+        createdAt: review.createdAt,
+      },
+    });
+  } catch (error) {
+    console.error("Update review error:", error);
+    return res.status(500).json({ error: "Failed to update review" });
   }
 });
 
