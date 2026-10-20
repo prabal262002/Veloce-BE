@@ -19,7 +19,7 @@ const JWT_SECRET = process.env.JWT_SECRET || (
 );
 
 app.use(express.json());
-const allowedOrigins = (process.env.FRONTEND_ORIGIN || "")
+const allowedOrigins = (process.env.FRONTEND_ORIGIN || "https://veloce-vert-one.vercel.app")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
