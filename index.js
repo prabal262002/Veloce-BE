@@ -19,10 +19,14 @@ const JWT_SECRET = process.env.JWT_SECRET || (
 );
 
 app.use(express.json());
-const allowedOrigins = (process.env.FRONTEND_ORIGIN || "http://localhost:5173")
+const allowedOrigins = (process.env.FRONTEND_ORIGIN || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+
+if (allowedOrigins.length === 0) {
+  console.warn("FRONTEND_ORIGIN is not configured; credentialed cross-origin requests will be blocked.");
+}
 
 app.use((req, res, next) => {
   const isPublicProductRequest =
@@ -241,9 +245,34 @@ async function getAllProducts() {
 app.get("/products", async (req, res) => {
   try {
     console.log("GET /products route hit!");
-    const products = await getAllProducts();
-    res.status(200).json({ products });
+    const [products, reviewSummaries] = await Promise.all([
+      getAllProducts(),
+      Review.aggregate([
+        {
+          $group: {
+            _id: "$product",
+            averageRating: { $avg: "$rating" },
+            reviewCount: { $sum: 1 },
+          },
+        },
+      ]),
+    ]);
+    const summariesByProductId = new Map(
+      reviewSummaries.map((summary) => [String(summary._id), summary])
+    );
+
+    res.status(200).json({
+      products: products.map((product) => {
+        const summary = summariesByProductId.get(String(product._id));
+        return {
+          ...product.toObject(),
+          ratingAverage: summary?.averageRating || 0,
+          reviewCount: summary?.reviewCount || 0,
+        };
+      }),
+    });
   } catch (error) {
+    console.error("Get products error:", error);
     res.status(500).json({ error: "Failed to retrieve products" });
   }
 });
