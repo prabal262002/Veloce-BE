@@ -9,6 +9,7 @@ const { initializeDB } = require("./db/db.connect.js");
 const Product = require("./models/product.model");
 const User = require("./models/user.model");
 const Review = require("./models/review.model");
+const Order = require("./models/order.model");
 
 dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
@@ -653,6 +654,173 @@ app.delete("/addresses/:addressId", authenticate, async (req, res) => {
   } catch (error) {
     console.error("Delete address error:", error);
     return res.status(500).json({ error: "Failed to remove address" });
+  }
+});
+
+app.post("/orders", authenticate, async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    const { addressId, promoCode } = req.body || {};
+    if (!mongoose.isValidObjectId(addressId)) {
+      return res.status(400).json({ error: "A valid delivery address is required" });
+    }
+
+    if (promoCode != null && typeof promoCode !== "string") {
+      return res.status(400).json({ error: "Promo code must be text" });
+    }
+    const normalizedPromoCode = promoCode?.trim().toUpperCase() || "";
+    if (normalizedPromoCode && normalizedPromoCode !== "VELOCE10") {
+      return res.status(400).json({ error: "This promo code is not valid" });
+    }
+
+    let createdOrder;
+    await session.withTransaction(async () => {
+      const user = await User.findById(req.user._id).session(session);
+      if (!user) {
+        const error = new Error("User not found");
+        error.statusCode = 404;
+        throw error;
+      }
+
+      const address = user.addresses.id(addressId);
+      if (!address) {
+        const error = new Error("Delivery address not found");
+        error.statusCode = 400;
+        throw error;
+      }
+      if (!user.cart.length) {
+        const error = new Error("Your cart is empty");
+        error.statusCode = 400;
+        throw error;
+      }
+
+      const requestedQuantities = new Map();
+      for (const item of user.cart) {
+        const productId = String(item.productId);
+        const quantity = Number(item.quantity);
+        if (!mongoose.isValidObjectId(productId) || !Number.isInteger(quantity) || quantity < 1) {
+          const error = new Error("Your cart contains an invalid item");
+          error.statusCode = 400;
+          throw error;
+        }
+        requestedQuantities.set(
+          productId,
+          (requestedQuantities.get(productId) || 0) + quantity,
+        );
+      }
+
+      const products = await Product.find({
+        _id: { $in: [...requestedQuantities.keys()] },
+        isActive: true,
+      }).session(session);
+      const productsById = new Map(products.map((product) => [String(product._id), product]));
+      const orderItems = [];
+      let subtotalCents = 0;
+
+      for (const [productId, quantity] of requestedQuantities) {
+        const product = productsById.get(productId);
+        if (!product) {
+          const error = new Error("Your cart contains an unavailable product");
+          error.statusCode = 400;
+          throw error;
+        }
+
+        const updatedProduct = await Product.findOneAndUpdate(
+          { _id: product._id, isActive: true, stock: { $gte: quantity } },
+          { $inc: { stock: -quantity } },
+          { new: true, session },
+        );
+        if (!updatedProduct) {
+          const error = new Error(`${product.name} no longer has enough stock`);
+          error.statusCode = 409;
+          throw error;
+        }
+
+        const unitPriceCents = Math.round(Number(updatedProduct.price) * 100);
+        const lineTotalCents = unitPriceCents * quantity;
+        subtotalCents += lineTotalCents;
+        orderItems.push({
+          productId: updatedProduct._id,
+          name: updatedProduct.name,
+          category: updatedProduct.category,
+          image: updatedProduct.images?.[0] || "",
+          unitPrice: unitPriceCents / 100,
+          quantity,
+          lineTotal: lineTotalCents / 100,
+        });
+      }
+
+      const discountCents = normalizedPromoCode === "VELOCE10"
+        ? Math.round(subtotalCents * 0.1)
+        : 0;
+      const [order] = await Order.create([{
+        user: user._id,
+        items: orderItems,
+        shippingAddress: {
+          fullName: address.fullName,
+          phone: address.phone,
+          addressLine1: address.addressLine1,
+          addressLine2: address.addressLine2 || "",
+          city: address.city,
+          state: address.state,
+          postalCode: address.postalCode,
+          country: address.country,
+        },
+        subtotal: subtotalCents / 100,
+        discountCode: normalizedPromoCode,
+        discountAmount: discountCents / 100,
+        total: (subtotalCents - discountCents) / 100,
+        paymentMethod: "COD",
+        paymentStatus: "unpaid",
+        status: "placed",
+      }], { session });
+
+      user.cart = [];
+      await user.save({ session });
+      createdOrder = order;
+    });
+
+    return res.status(201).json({ order: createdOrder });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
+    console.error("Create order error:", error);
+    return res.status(500).json({ error: "Unable to place your order" });
+  } finally {
+    await session.endSession();
+  }
+});
+
+app.get("/orders", authenticate, async (req, res) => {
+  try {
+    const orders = await Order.find({ user: req.user._id }).sort({ createdAt: -1 }).lean();
+    return res.status(200).json({ orders });
+  } catch (error) {
+    console.error("Get orders error:", error);
+    return res.status(500).json({ error: "Unable to fetch your orders" });
+  }
+});
+
+app.get("/orders/:orderId", authenticate, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.orderId)) {
+      return res.status(400).json({ error: "Invalid order ID" });
+    }
+
+    const order = await Order.findOne({
+      _id: req.params.orderId,
+      user: req.user._id,
+    }).lean();
+    if (!order) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+
+    return res.status(200).json({ order });
+  } catch (error) {
+    console.error("Get order error:", error);
+    return res.status(500).json({ error: "Unable to fetch this order" });
   }
 });
 
