@@ -15,8 +15,9 @@ dns.setServers(["8.8.8.8", "8.8.4.4"]);
 
 const app = express();
 const PORT = process.env.PORT || 5001;
+const IS_PRODUCTION = process.env.NODE_ENV === "production" || process.env.VERCEL === "1";
 const JWT_SECRET = process.env.JWT_SECRET || (
-  process.env.NODE_ENV === "production" ? "" : "veloce-dev-secret"
+  IS_PRODUCTION ? "" : "veloce-dev-secret"
 );
 
 app.use(express.json());
@@ -66,8 +67,8 @@ const requireJwtSecret = (req, res, next) => {
 
 const sessionCookieOptions = {
   httpOnly: true,
-  secure: process.env.NODE_ENV === "production",
-  sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+  secure: IS_PRODUCTION,
+  sameSite: IS_PRODUCTION ? "none" : "lax",
   maxAge: 7 * 24 * 60 * 60 * 1000,
   path: "/",
 };
