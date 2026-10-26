@@ -29,7 +29,24 @@ const productSchema = new mongoose.Schema(
 
     category: {
       type: String,
-      enum: ['parts', 'gear', 'accessories'],
+      enum: [
+        'parts',
+        'gear',
+        'accessories',
+        'helmets',
+        'riding-jackets',
+        'riding-pants',
+        'gloves',
+        'boots',
+        'protection',
+        'tires',
+        'brakes',
+        'exhaust',
+        'suspension',
+        'electronics',
+        'luggage',
+        'maintenance',
+      ],
       required: true,
     },
 

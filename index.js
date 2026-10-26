@@ -233,6 +233,42 @@ app.post("/products", async (req, res) => {
   }
 });
 
+app.post("/products/bulk", async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    const products = req.body;
+    if (!Array.isArray(products) || products.length === 0 || products.length > 50) {
+      return res.status(400).json({ error: "Submit an array of 1 to 50 products" });
+    }
+    if (products.some((product) => !product || typeof product !== "object" || Array.isArray(product))) {
+      return res.status(400).json({ error: "Every product must be a JSON object" });
+    }
+
+    let savedProducts = [];
+    await session.withTransaction(async () => {
+      savedProducts = await Product.insertMany(products, { session, ordered: true });
+    });
+
+    return res.status(201).json({
+      message: `${savedProducts.length} products created successfully`,
+      count: savedProducts.length,
+      products: savedProducts,
+    });
+  } catch (error) {
+    if (error.name === "ValidationError" || error.name === "CastError") {
+      return res.status(400).json({ error: error.message });
+    }
+    if (error.code === 11000) {
+      return res.status(409).json({ error: "A product with one of these slugs already exists" });
+    }
+    console.error("Bulk product import error:", error);
+    return res.status(500).json({ error: "Failed to import products" });
+  } finally {
+    await session.endSession();
+  }
+});
+
 async function getAllProducts() {
   try {
     const products = await Product.find();
