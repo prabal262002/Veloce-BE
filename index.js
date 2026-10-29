@@ -373,6 +373,10 @@ app.post("/login", requireJwtSecret, async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password" });
     }
 
+    if (!user.password) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return res.status(401).json({ error: "Invalid email or password" });
