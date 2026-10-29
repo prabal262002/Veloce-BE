@@ -5,6 +5,7 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const { OAuth2Client } = require("google-auth-library");
 const { initializeDB } = require("./db/db.connect.js");
 const Product = require("./models/product.model");
 const User = require("./models/user.model");
@@ -19,6 +20,8 @@ const IS_PRODUCTION = process.env.NODE_ENV === "production" || process.env.VERCE
 const JWT_SECRET = process.env.JWT_SECRET || (
   IS_PRODUCTION ? "" : "veloce-dev-secret"
 );
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const googleOAuthClient = new OAuth2Client(GOOGLE_CLIENT_ID || undefined);
 
 app.use(express.json());
 const allowedOrigins = (process.env.FRONTEND_ORIGIN || "https://veloce-vert-one.vercel.app")
@@ -391,6 +394,82 @@ app.post("/login", requireJwtSecret, async (req, res) => {
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ error: "Failed to login" });
+  }
+});
+
+app.post("/auth/google", requireJwtSecret, async (req, res) => {
+  if (!GOOGLE_CLIENT_ID) {
+    return res.status(503).json({ error: "Google sign-in is not configured" });
+  }
+
+  const { credential } = req.body || {};
+  if (typeof credential !== "string" || credential.length === 0 || credential.length > 10000) {
+    return res.status(400).json({ error: "A valid Google credential is required" });
+  }
+
+  let googleProfile;
+  try {
+    const ticket = await googleOAuthClient.verifyIdToken({
+      idToken: credential,
+      audience: GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+
+    if (!payload?.sub || !payload.email || payload.email_verified !== true) {
+      return res.status(401).json({ error: "Google account could not be verified" });
+    }
+
+    googleProfile = {
+      googleId: payload.sub,
+      email: payload.email.trim().toLowerCase(),
+      name: payload.name?.trim() || payload.email.split("@")[0],
+    };
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired Google credential" });
+  }
+
+  try {
+    let user = await User.findOne({ googleId: googleProfile.googleId }).select("+googleId");
+    let isNewUser = false;
+
+    if (!user) {
+      const emailUser = await User.findOne({ email: googleProfile.email }).select("+password +googleId");
+      if (emailUser) {
+        return res.status(409).json({
+          error: "An account already exists with this email. Sign in with your password first; account linking is not available yet.",
+        });
+      }
+
+      user = await createUser(googleProfile);
+      isNewUser = true;
+    }
+
+    setSessionCookie(res, user);
+    return res.status(isNewUser ? 201 : 200).json({
+      message: isNewUser ? "Google account created successfully" : "Google sign-in successful",
+      user: sanitizeUser(user),
+    });
+  } catch (error) {
+    if (error.code === 11000) {
+      const existingGoogleUser = await User.findOne({
+        googleId: googleProfile.googleId,
+      }).select("+googleId");
+
+      if (existingGoogleUser) {
+        setSessionCookie(res, existingGoogleUser);
+        return res.status(200).json({
+          message: "Google sign-in successful",
+          user: sanitizeUser(existingGoogleUser),
+        });
+      }
+
+      return res.status(409).json({
+        error: "An account already exists with this email. Sign in with your password first; account linking is not available yet.",
+      });
+    }
+
+    console.error("Google sign-in error:", error);
+    return res.status(500).json({ error: "Unable to sign in with Google" });
   }
 });
 
